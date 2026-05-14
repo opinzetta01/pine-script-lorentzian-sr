@@ -1,0 +1,551 @@
+// Improved by Antigravity
+
+//@version=6
+indicator("Lorentzian Key S/R Level Detector [By OSKY]", shorttitle = "🧮 MTF Lorentzian S/R", overlay = true, max_lines_count = 20, max_labels_count = 100)
+
+// === INPUTS ===
+clusterGR = "Clustering Settings"
+src = input.source(close, "Source", group = clusterGR, tooltip = "Source data for clustering")
+autoK = input.bool(true, "Auto K-Levels Selection (Elbow Method)", group = clusterGR, tooltip = "Automatically determine optimal no of levelfor support and resistance using Elbow Method with Sharpness Heuristic")
+manualK = input.int(3, "Manual K-Levels (if Auto disabled)", minval = 2, maxval = 6, group = clusterGR, tooltip = "Fixed number of clusters when Auto K is disabled")
+sample_size = input.int(250, "Sample Size", minval = 20, maxval = 500, group = clusterGR, tooltip = "Number of recent bars to use for clustering (smaller = faster)\n Use 50~150 for shorter tf, & > 150 for higher.")
+max_iterations = 50
+
+// === MTF INPUTS ===
+mtfGR = "Multi-Timeframe Settings"
+mtf_timeframe = input.timeframe("", "Timeframe for S/R Detection", group = mtfGR, 
+     tooltip = "Select HIGHER timeframe for stronger S/R levels. Lower TF not recommended.")
+
+// Add validation
+if mtf_timeframe != "" and timeframe.in_seconds(mtf_timeframe) < timeframe.in_seconds(timeframe.period)
+    runtime.error("⚠️ Please select a timeframe HIGHER than or equal to the chart timeframe")
+
+displayGR = "Display Settings"
+res_color = input.color(color.new(color.red, 0), "Resistance Color", group = displayGR)
+sup_color = input.color(color.new(color.green, 0), "Support Color", group = displayGR)
+show_bands = input.bool(true, "Show Cluster Bands", group = displayGR)
+show_metrics = input.bool(true, "Show Metrics Table", group = displayGR)
+show_wcss_table = input.bool(true, "Show WCSS Analysis", group = displayGR)
+dashLoc = input.string("Bottom Left", title="📍WCSS Table Position", 
+                                     options=["Top Left", "Top Center", 
+                                           "Middle Left", "Middle Center", "Middle Right",
+                                           "Bottom Left", "Bottom Center", "Bottom Right"], group = displayGR)
+
+alertGR = "Alert Settings"
+alert_threshold = input.float(0.5, "Alert Proximity (ATR Mult)", group=alertGR, tooltip="Multiplier for ATR to trigger proximity alerts")
+
+// === GLOBAL VARIABLES ===
+var float[] sample_data = array.new_float(0)
+var float[] wcss_values = array.new_float(5, 0.0) 
+var float[] sharpness_values = array.new_float(3, 0.0) 
+var int optimal_k = 3
+var float[] final_centroids = array.new_float(0)
+var float[] final_stdevs = array.new_float(0)
+var int[] final_assignments = array.new_int(0)
+var int[] cluster_sizes = array.new_int(0)
+
+// Arrays to store visual elements for deletion
+var line[] cluster_lines = array.new<line>(0)
+var line[] band_lines = array.new<line>(0)
+var linefill[] band_fills = array.new<linefill>(0)
+var label[] cluster_labels = array.new<label>(0)
+var float current_entropy = na
+
+var table metrics_table = na
+var table wcss_table = na
+
+// === UTILITY FUNCTIONS ===
+get_position() =>
+    switch dashLoc
+        "Top Left" => position.top_left
+        "Top Center" => position.top_center
+        "Middle Left" => position.middle_left
+        "Middle Center" => position.middle_center
+        "Middle Right" => position.middle_right
+        "Bottom Left" => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        => position.bottom_right
+
+
+custom_ema(source_data, len) => 
+    alpha = 2.0 / (len + 1)
+    var float ema = na
+    ema := na(ema) ? nz(source_data) : alpha * nz(source_data) + (1 - alpha) * ema
+    ema
+
+calculate_entropy() =>
+    price_changes = src - src[1]
+    entropy = -ta.sma(price_changes * math.log(math.abs(price_changes) + 1e-10), 10) / math.log(10)
+    custom_ema(entropy, 14) 
+
+lorentzian_distance(float a, float b, float ent) =>
+    e = nz(ent, 1.0)
+    valA = nz(a, 0.0)
+    valB = nz(b, 0.0)
+    bandwidth = 2 * math.pow(e, 2)
+    sigma = math.sqrt(bandwidth)
+    
+    sigma := math.max(sigma, 0.001)
+    
+    math.log(1 + math.pow(valA - valB, 2) / math.pow(sigma, 2))
+
+// Calculate K-means centroid (average)
+calculate_centroid(float[] cluster_data) =>
+    if array.size(cluster_data) == 0
+        0.0
+    else
+        array.avg(cluster_data)
+
+// Calculate standard deviation
+calculate_stdev(float[] data, float mean) =>
+    if array.size(data) <= 1
+        0.0
+    else
+        sum_sq_diff = 0.0
+        for i = 0 to array.size(data) - 1
+            diff = array.get(data, i) - mean
+            sum_sq_diff += diff * diff
+        math.sqrt(sum_sq_diff / array.size(data))
+
+// Calculate WCSS for given centroids and assignments
+calculate_wcss(float[] data, float[] centroids, int[] assignments, float ent) =>
+    wcss = 0.0
+    for i = 0 to array.size(data) - 1
+        if i < array.size(assignments)
+            cluster_id = array.get(assignments, i)
+            if cluster_id < array.size(centroids)
+                centroid = array.get(centroids, cluster_id)
+                point = array.get(data, i)
+                wcss += math.pow(lorentzian_distance(point, centroid, ent), 2)
+    wcss
+
+round_to_decimal(value, decimals) =>
+    factor = math.pow(10, decimals)
+    math.round(value * factor) / factor
+
+// K-means clustering for a specific K
+kmeans_cluster(float[] data, int k, int max_iter, float ent) =>
+    n = array.size(data)
+    if n < k or k < 1
+        [array.new_float(), array.new_float(), array.new_int()]
+    else
+        // Initialize centroids
+        // For 1D sorted data, picking evenly spaced quantiles is equivalent to K-Means++ initialization
+        centroids = array.new_float()
+        for i = 0 to k - 1
+            idx = math.round(i * (n - 1) / (k - 1))
+            array.push(centroids, array.get(data, idx))
+        
+        assignments = array.new_int(n, 0)
+        prev_assignments = array.new_int(n, -1)
+        
+        // Main clustering loop
+        converged = false
+        iteration = 0
+        
+        while not converged and iteration < max_iter
+            iteration += 1
+            
+            // Assignment step
+            for i = 0 to n - 1
+                point = array.get(data, i)
+                min_dist = 999999999.0  
+                best_cluster = 0
+                
+                for j = 0 to k - 1
+                    centroid = array.get(centroids, j)
+                    dist = lorentzian_distance(point, centroid, ent)
+                    if dist < min_dist
+                        min_dist := dist
+                        best_cluster := j
+                
+                array.set(assignments, i, best_cluster)
+            
+            // Check convergence
+            converged := true
+            for i = 0 to n - 1
+                if array.get(assignments, i) != array.get(prev_assignments, i)
+                    converged := false
+                    break
+            
+            if not converged
+                
+                for j = 0 to k - 1
+                    cluster_data = array.new_float()
+                    for i = 0 to n - 1
+                        if array.get(assignments, i) == j
+                            array.push(cluster_data, array.get(data, i))
+                    
+                    if array.size(cluster_data) > 0
+                        new_centroid = calculate_centroid(cluster_data)
+                        array.set(centroids, j, new_centroid)
+                
+                // Copy current assignments to previous
+                for i = 0 to n - 1
+                    array.set(prev_assignments, i, array.get(assignments, i))
+        
+        // Calculate standard deviations
+        stdevs = array.new_float()
+        for j = 0 to k - 1
+            cluster_data = array.new_float()
+            for i = 0 to n - 1
+                if array.get(assignments, i) == j
+                    array.push(cluster_data, array.get(data, i))
+            
+            centroid = array.get(centroids, j)
+            stdev = calculate_stdev(cluster_data, centroid)
+            array.push(stdevs, stdev)
+        
+        [centroids, stdevs, assignments]
+
+// === GLOBAL MTF EVALUATION ===
+htf_src = request.security(syminfo.tickerid, mtf_timeframe != "" ? mtf_timeframe : timeframe.period, src, lookahead=barmerge.lookahead_on)
+htf_idx = request.security(syminfo.tickerid, mtf_timeframe != "" ? mtf_timeframe : timeframe.period, bar_index, lookahead=barmerge.lookahead_on)
+
+var float[] current_sample = array.new_float(0)
+var int prev_htf_idx = -1
+
+// Continuously build the sample array locally based on HTF bar changes
+if not na(htf_src) and not na(htf_idx)
+    if htf_idx != prev_htf_idx
+        array.unshift(current_sample, htf_src)
+        if array.size(current_sample) > sample_size
+            array.pop(current_sample)
+        prev_htf_idx := htf_idx
+
+current_entropy := mtf_timeframe != "" ? 
+      request.security(syminfo.tickerid, mtf_timeframe, calculate_entropy(), lookahead=barmerge.lookahead_off) : 
+      calculate_entropy()
+
+// === MAIN CALCULATION WITH MTF SUPPORT ===
+bool should_recalculate = mtf_timeframe == "" ? barstate.islast : barstate.isrealtime or barstate.islast
+
+if should_recalculate or (mtf_timeframe != "" and timeframe.change(mtf_timeframe))
+    
+    sample_copy = array.copy(current_sample)
+    array.sort(sample_copy)
+    
+    if array.size(sample_copy) >= 4
+        ent = nz(current_entropy, 1.0)
+        
+        // ALWAYS calculate WCSS for all K values (for the table)
+        for k = 2 to 6
+            [centroids, _, assignments] = kmeans_cluster(sample_copy, k, max_iterations, ent)
+            wcss = calculate_wcss(sample_copy, centroids, assignments, ent)
+            array.set(wcss_values, k - 2, wcss)
+        
+        // ALWAYS calculate sharpness values
+        for k = 3 to 5
+            wcss_prev = array.get(wcss_values, k - 3) // K-1
+            wcss_curr = array.get(wcss_values, k - 2) // K
+            wcss_next = array.get(wcss_values, k - 1) // K+1
+            
+            delta1 = wcss_prev - wcss_curr
+            delta2 = wcss_curr - wcss_next
+            sharpness = delta1 - delta2
+            
+            array.set(sharpness_values, k - 3, sharpness)
+        
+        // Determine optimal K
+        if autoK
+            // Find optimal K using sharpness
+            best_k = 3
+            max_sharpness = -999999999.0
+            
+            for k = 3 to 5
+                sharpness = array.get(sharpness_values, k - 3)
+                if sharpness > max_sharpness
+                    max_sharpness := sharpness
+                    best_k := k
+            
+            optimal_k := best_k
+        else
+            optimal_k := manualK
+        
+        // Perform final clustering with chosen K
+        [final_cents, final_stdevs_arr, final_assigns] = kmeans_cluster(sample_copy, optimal_k, max_iterations, ent)
+        
+        // Store results
+        final_centroids := array.copy(final_cents)
+        final_stdevs := array.copy(final_stdevs_arr)
+        final_assignments := array.copy(final_assigns)
+        
+        // Calculate cluster sizes
+        array.clear(cluster_sizes)
+        for i = 0 to optimal_k - 1
+            array.push(cluster_sizes, 0)
+        
+        for i = 0 to array.size(final_assignments) - 1
+            cluster_id = array.get(final_assignments, i)
+            if cluster_id < array.size(cluster_sizes)
+                current_size = array.get(cluster_sizes, cluster_id)
+                array.set(cluster_sizes, cluster_id, current_size + 1)
+
+// === VISUALIZATION ===
+
+// Clean up previous visual elements
+delete_previous_visuals() =>
+    // Delete all previous lines
+    while array.size(cluster_lines) > 0
+        line.delete(array.pop(cluster_lines))
+    while array.size(band_lines) > 0
+        line.delete(array.pop(band_lines))
+    
+    // Delete all previous linefills
+    while array.size(band_fills) > 0
+        linefill.delete(array.pop(band_fills))
+    
+    // Delete all previous labels
+    while array.size(cluster_labels) > 0
+        label.delete(array.pop(cluster_labels))
+
+sorted_centroids = array.new<float>()
+sorted_indices = array.new<int>()
+
+if barstate.islast and array.size(final_centroids) > 0
+    // Clear arrays first to prevent accumulation
+    array.clear(sorted_centroids)
+    array.clear(sorted_indices)
+    
+    // Create sorted index array based on centroid values (descending order)
+    for i = 0 to array.size(final_centroids) - 1
+        array.push(sorted_centroids, array.get(final_centroids, i))
+        array.push(sorted_indices, i)
+    
+    // Simple bubble sort to get indices of sorted centroids (highest to lowest)
+    for i = 0 to array.size(sorted_centroids) - 2
+        for j = 0 to array.size(sorted_centroids) - 2 - i
+            if array.get(sorted_centroids, j) < array.get(sorted_centroids, j + 1)
+                // Swap centroids
+                temp_val = array.get(sorted_centroids, j)
+                array.set(sorted_centroids, j, array.get(sorted_centroids, j + 1))
+                array.set(sorted_centroids, j + 1, temp_val)
+                // Swap indices
+                temp_idx = array.get(sorted_indices, j)
+                array.set(sorted_indices, j, array.get(sorted_indices, j + 1))
+                array.set(sorted_indices, j + 1, temp_idx)
+
+// Calculate Nearest S/R Distances for plots and alerts
+float atr_val = ta.atr(14)
+float nearest_dist = 999999.0
+float nearest_level = 0.0
+
+if array.size(final_centroids) > 0
+    for i = 0 to array.size(final_centroids) - 1
+        dist = math.abs(close - array.get(final_centroids, i))
+        if dist < nearest_dist
+            nearest_dist := dist
+            nearest_level := array.get(final_centroids, i)
+
+plot(nearest_dist, title="Dist to Nearest S/R", display=display.data_window)
+plot(nearest_level, title="Nearest S/R Level", display=display.data_window)
+
+// Plot cluster levels and bands
+if barstate.islast and array.size(final_centroids) > 0
+    // Clean up all previous visual elements first
+    delete_previous_visuals()
+    
+    // Calculate global max size and max stdev for Strength Score
+    max_cluster_size = 0
+    max_cluster_stdev = 0.0
+    for i = 0 to array.size(cluster_sizes) - 1
+        max_cluster_size := math.max(max_cluster_size, array.get(cluster_sizes, i))
+        max_cluster_stdev := math.max(max_cluster_stdev, array.get(final_stdevs, i))
+    
+    // Determine how many Resistances we have
+    total_res = 0
+    for i = 0 to array.size(sorted_centroids) - 1
+        if array.get(sorted_centroids, i) > close
+            total_res += 1
+            
+    r_idx = total_res
+    s_idx = 1
+    
+    for rank = 0 to array.size(final_centroids) - 1
+        original_idx = array.get(sorted_indices, rank)
+        level = array.get(final_centroids, original_idx)
+        stdev = array.get(final_stdevs, original_idx)
+        cluster_size = array.get(cluster_sizes, original_idx)
+        
+        if cluster_size > 0
+            // Calculate Strength Score (0 to 100)
+            size_score = max_cluster_size > 0 ? (cluster_size / max_cluster_size) * 50.0 : 0.0
+            stdev_score = max_cluster_stdev > 0 ? ((max_cluster_stdev - stdev) / max_cluster_stdev) * 50.0 : 50.0
+            strength_score = math.round(size_score + stdev_score)
+            
+            // Count Historical Touches
+            touches = 0
+            max_bars_lookback = math.min(sample_size, bar_index)
+            for j = 0 to max_bars_lookback - 1
+                if high[j] >= level and low[j] <= level
+                    touches += 1
+            
+            // Determine if Resistance or Support
+            is_resistance = level > close
+            cluster_color = is_resistance ? res_color : sup_color
+            
+            label_prefix = ""
+            if is_resistance
+                label_prefix := "R" + str.tostring(r_idx)
+                r_idx -= 1
+            else
+                label_prefix := "S" + str.tostring(s_idx)
+                s_idx += 1
+                
+            // Dynamic Line Width based on Strength Score
+            line_width = strength_score >= 80 ? 3 : (strength_score >= 50 ? 2 : 1)
+            
+            // Main level line
+            main_line = line.new(bar_index - 20, level, bar_index + 10, level, 
+                               extend = extend.left, color = cluster_color, width = line_width)
+            array.push(cluster_lines, main_line)
+            
+            // Standard deviation bands
+            if show_bands and stdev > 0
+                upper_line = line.new(bar_index - 20, level + stdev, bar_index + 10, level + stdev,
+                                     extend = extend.left, color = color.new(cluster_color, 70), width = 1)
+                lower_line = line.new(bar_index - 20, level - stdev, bar_index + 10, level - stdev,
+                                     extend = extend.left, color = color.new(cluster_color, 70), width = 1)
+                array.push(band_lines, upper_line)
+                array.push(band_lines, lower_line)
+                
+                band_fill = linefill.new(upper_line, lower_line, color.new(cluster_color, 90))
+                array.push(band_fills, band_fill)
+            
+            // Level labels with strength information
+            total_sample = array.size(sample_data)
+            density_pct = total_sample > 0 ? round_to_decimal(cluster_size * 100.0 / total_sample, 1) : 0.0
+     
+            // Create strength indicator text
+            info_text = "Score: " + str.tostring(strength_score) + "/100\n" + str.tostring(touches) + " Touches\n(" + str.tostring(density_pct) + "%)"
+            
+            cluster_label = label.new(bar_index + 6, level, 
+                                     label_prefix + " " + str.tostring(level, "#.##") + "\n" + info_text,
+                                     style = label.style_label_left, color = color.new(cluster_color, 20),
+                                     textcolor = color.white, size = size.normal)
+            array.push(cluster_labels, cluster_label)
+
+
+// Main metrics table
+if show_metrics and barstate.islast
+
+    if na(metrics_table)
+        metrics_table := table.new(position.top_right, 2, 7, 
+                                   bgcolor = color.new(color.black, 80),
+                                   border_width = 1, border_color = color.gray)
+    
+    // Clear and repopulate table content
+    table.clear(metrics_table, 0, 0, 1, 6)  
+    
+    table.cell(metrics_table, 0, 0, "Metric", text_color = color.white, text_size = size.small, bgcolor = color.new(color.blue, 70))
+    table.cell(metrics_table, 1, 0, "Value", text_color = color.white, text_size = size.small, bgcolor = color.new(color.blue, 70))
+    
+    // MTF Status with formatted display
+    table.cell(metrics_table, 0, 1, "Timeframe", text_color = color.white, text_size = size.small)
+    
+    // Format timeframe display
+    tf_to_display = mtf_timeframe == "" ? timeframe.period : mtf_timeframe
+    formatted_tf = ""
+    
+    if str.contains(tf_to_display, "S")
+        formatted_tf := tf_to_display 
+    else if str.contains(tf_to_display, "D")
+        formatted_tf := tf_to_display  
+    else if str.contains(tf_to_display, "W")
+        formatted_tf := tf_to_display
+    else if str.contains(tf_to_display, "M")
+        formatted_tf := str.replace(tf_to_display, "M", "Mn") 
+    else
+        // Handle minutes and convert to hours if >= 60
+        tf_minutes = str.tonumber(tf_to_display)
+        if na(tf_minutes)
+            formatted_tf := tf_to_display
+        else if tf_minutes >= 60
+            hours = tf_minutes / 60
+            formatted_tf := str.tostring(hours) + "hr"
+        else
+            formatted_tf := str.tostring(tf_minutes) + "m"
+    
+    table.cell(metrics_table, 1, 1, formatted_tf, text_color = color.lime, text_size = size.small)
+    
+    table.cell(metrics_table, 0, 2, "Method", text_color = color.white, text_size = size.small)
+    table.cell(metrics_table, 1, 2, autoK ? "Auto" : "Manual", text_color = color.white, text_size = size.small)
+    
+    table.cell(metrics_table, 0, 3, "Optimal K", text_color = color.white, text_size = size.small)
+    table.cell(metrics_table, 1, 3, str.tostring(optimal_k), text_color = color.yellow, text_size = size.small)
+    
+    table.cell(metrics_table, 0, 4, "Sample Size", text_color = color.white, text_size = size.small)
+    table.cell(metrics_table, 1, 4, str.tostring(array.size(sample_data)), text_color = color.white, text_size = size.small)
+    
+    if array.size(cluster_sizes) > 0
+        max_size = 0
+        max_cluster_rank = 0
+        
+        for i = 0 to array.size(cluster_sizes) - 1
+            current_size = array.get(cluster_sizes, i)
+            if current_size > max_size
+                max_size := current_size
+                for rank = 0 to array.size(sorted_indices) - 1
+                    if array.get(sorted_indices, rank) == i
+                        // Find label prefix (R or S)
+                        // It requires checking if it was R or S, but for simplicity we can just display the index
+                        max_cluster_rank := rank + 1
+                        break
+        
+        table.cell(metrics_table, 0, 5, "Largest Cluster", text_color = color.white, text_size = size.small)
+        table.cell(metrics_table, 1, 5, "Lvl " + str.tostring(max_cluster_rank) + " (" + str.tostring(max_size) + ")", text_color = color.white, text_size = size.small)
+else
+    // Hide table when disabled
+    if not na(metrics_table)
+        table.delete(metrics_table)
+        metrics_table := na
+
+// WCSS table
+if show_wcss_table and barstate.islast
+
+    if na(wcss_table)
+        wcss_table := table.new(get_position(), 4, 6,
+                                 bgcolor = color.new(color.black, 80),
+                                 border_width = 1, border_color = color.gray)
+    
+    // Clear and repopulate table content
+    table.clear(wcss_table, 0, 0, 3, 5) 
+    
+    table.cell(wcss_table, 0, 0, "K", text_color = color.white, text_size = size.small, bgcolor = color.new(color.green, 70))
+    table.cell(wcss_table, 1, 0, "WCSS", text_color = color.white, text_size = size.small, bgcolor = color.new(color.green, 70))
+    table.cell(wcss_table, 2, 0, "Sharpness", text_color = color.white, text_size = size.small, bgcolor = color.new(color.green, 70))
+    table.cell(wcss_table, 3, 0, "Selected", text_color = color.white, text_size = size.small, bgcolor = color.new(color.green, 70))
+    
+    for k = 2 to 6
+        row = k - 1
+        wcss_val = array.get(wcss_values, k - 2)
+        
+        k_color = k == optimal_k ? color.yellow : color.white
+        table.cell(wcss_table, 0, row, str.tostring(k), text_color = k_color, text_size = size.small)
+        
+        table.cell(wcss_table, 1, row, str.tostring(wcss_val, "#.##"), text_color = color.white, text_size = size.small)
+        
+        if k >= 3 and k <= 5
+            sharpness_val = array.get(sharpness_values, k - 3)
+            sharpness_color = sharpness_val > 0 ? color.lime : color.red
+            table.cell(wcss_table, 2, row, str.tostring(sharpness_val, "#.##"), text_color = sharpness_color, text_size = size.small)
+        else
+            table.cell(wcss_table, 2, row, "-", text_color = color.gray, text_size = size.small)
+        
+        selected_text = k == optimal_k ? "✓" : ""
+        table.cell(wcss_table, 3, row, selected_text, text_color = color.yellow, text_size = size.small)
+else
+    // Hide table when disabled
+    if not na(wcss_table)
+        table.delete(wcss_table)
+        wcss_table := na
+
+// === ALERTS ===
+// Alert when optimal K changes
+alertcondition(ta.change(optimal_k) != 0, "Optimal K Changed", "Optimal number of clusters changed to {{plot(\"Optimal K\")}}")
+
+// Alert when price is near a key level
+alertcondition(nearest_dist <= (atr_val * alert_threshold), "Price near S/R Level", "Price is approaching a key S/R level!")
+
+// Plot for alert reference
+plot(optimal_k, "Optimal K", display = display.data_window)

@@ -1,0 +1,116 @@
+//@version=6
+indicator("Konkorde NextGen - Independent Pro", "Konkorde Pro", overlay=false, precision=2)
+
+// --------------------------------------------------------------------------------
+// Inputs de Configuración
+// --------------------------------------------------------------------------------
+grp_main = "Ajustes de Cálculo"
+i_src    = input.source(hlc3, "Fuente de Datos", group=grp_main)
+i_p      = input.int(15, "Periodo Vigía", 1, group=grp_main)
+i_m      = input.int(20, "Suavizado Tendencia", 1, group=grp_main)
+
+grp_money = "Flujo de Instituciones vs Retail"
+i_mfLen  = input.int(14, "Mano Fuerte (MFI)", 5, group=grp_money)
+i_rdLen  = input.int(14, "Mano Débil (Stoch)", 5, group=grp_money)
+
+grp_mtf  = "Contexto Analítico (v6)"
+i_htf    = input.timeframe("60", "Timeframe Institucional", group=grp_mtf)
+
+// --------------------------------------------------------------------------------
+// Lógica de Cálculo
+// --------------------------------------------------------------------------------
+// 1. Montaña (Vigía)
+float rsi_vgia = ta.rsi(i_src, i_p)
+float montana  = ta.ema(rsi_vgia, i_m) - 50 
+
+// 1.1 Contexto MTF Dinámico (Pine Script v6)
+// Traemos la tendencia de la montaña desde un Timeframe mayor para filtrar el ruido.
+float htf_montana = request.security(syminfo.tickerid, i_htf, montana)
+
+// 2. Línea de Señal (Roja)
+float signal = ta.ema(montana, 7)
+
+// 3. Mano Fuerte (Azul)
+float mfi_raw = ta.mfi(i_src, i_mfLen)
+float mano_fuerte = (mfi_raw - 50) * 0.6
+
+// 4. Mano Débil (Verde)
+float stoch_raw = ta.stoch(close, high, low, i_rdLen)
+float mano_debil = (stoch_raw - 50) * 0.4
+
+// --------------------------------------------------------------------------------
+// Lógica de Colores Dinámicos
+// --------------------------------------------------------------------------------
+// La montaña cambia de color si está en tendencia alcista confirmada y apoyada por el HTF
+bool tendencia_fuerte = montana > signal and montana > 0 and htf_montana > 0
+color color_montana = tendencia_fuerte ? color.new(#00ff88, 40) : color.new(#795548, 50)
+
+// --------------------------------------------------------------------------------
+// Visualización y Áreas
+// --------------------------------------------------------------------------------
+hline(0, "Eje Cero", color.new(color.gray, 50), hline.style_dashed)
+
+// Áreas
+plot(montana, "Montaña", color_montana, 1, plot.style_area)
+plot(mano_debil, "Mano Débil (Verde)", color.new(#4caf50, 40), 1, plot.style_area)
+plot(mano_fuerte, "Mano Fuerte (Azul)", color.new(#00e5ff, 30), 1, plot.style_area)
+
+// Línea de Señal
+plot(signal, "Señal Roja", #ff1744, 2)
+
+// --------------------------------------------------------------------------------
+// Patrones Visuales
+// --------------------------------------------------------------------------------
+bool primavera = mano_fuerte > 0 and mano_debil < 0
+bool abrazo    = mano_fuerte > montana and montana > 0
+
+plotchar(primavera, "Primavera", "●", location.bottom, color.aqua, size=size.tiny)
+plotchar(abrazo, "Abrazo", "★", location.top, color.yellow, size=size.tiny)
+
+// --------------------------------------------------------------------------------
+// [NUEVO] Análisis Quant: Divergencia en Tiempo Real (Anticipación Robusta)
+// --------------------------------------------------------------------------------
+int lookback = 20
+
+// 1. Buscamos los extremos locales (retrasados 1 barra para comparar con el actual)
+float max_p = ta.highest(close, lookback)[1]
+float min_p = ta.lowest(close, lookback)[1]
+float max_mf = ta.highest(mano_fuerte, lookback)[1]
+float min_mf = ta.lowest(mano_fuerte, lookback)[1]
+float max_montana = ta.highest(montana, lookback)[1]
+float min_montana = ta.lowest(montana, lookback)[1]
+
+// 2. Suavizado para confirmar la dirección actual de la mano fuerte
+float smooth_mf = ta.ema(mano_fuerte, 3)
+
+// 3. Divergencia Bajista (Agotamiento Alcista):
+// El precio hace nuevo máximo de 20 barras, PERO la mano fuerte cayó > 50% y la Montaña (RSI) perdió > 20% de su fuerza.
+// Esto evita dar señales falsas en subidas parabólicas donde el volumen cae pero el momento sigue intacto.
+bool divergencia_bajista = (close >= max_p) and (max_mf > 0) and (mano_fuerte < max_mf * 0.5) and (montana < max_montana * 0.8) and ta.falling(smooth_mf, 2) and (montana > 0)
+
+// 4. Divergencia Alcista (Agotamiento Bajista):
+// El precio hace nuevo mínimo, PERO la presión vendedora (negativa) cayó > 50% y la caída de la montaña se ha frenado > 20%.
+bool divergencia_alcista = (close <= min_p) and (min_mf < 0) and (mano_fuerte > min_mf * 0.5) and (montana > min_montana * 0.8) and ta.rising(smooth_mf, 2) and (montana < 0)
+
+
+// Patrones de Anticipación Visuales
+plotshape(divergencia_bajista, title="Agotamiento Alcista", style=shape.xcross, location=location.top, color=color.red, size=size.tiny)
+plotshape(divergencia_alcista, title="Agotamiento Bajista", style=shape.triangleup, location=location.bottom, color=color.lime, size=size.tiny)
+
+// Logging para depuración en Pine Logs (Característica v6)
+if divergencia_bajista
+    log.warning("Alerta Temprana: Posible giro a la baja detectado. Precio: " + str.tostring(close))
+if divergencia_alcista
+    log.info("Alerta Temprana: Posible giro al alza detectado. Precio: " + str.tostring(close))
+
+// --------------------------------------------------------------------------------
+// Alertas (Actualizadas)
+// --------------------------------------------------------------------------------
+if divergencia_bajista
+    alert("Konkorde Quant: ⚠️ Agotamiento institucional anticipado (Venta)", alert.freq_once_per_bar_close)
+if divergencia_alcista
+    alert("Konkorde Quant: 🚀 Agotamiento institucional anticipado (Compra)", alert.freq_once_per_bar_close)
+if ta.crossover(montana, signal)
+    alert("Konkorde: Señal de Compra Clásica", alert.freq_once_per_bar_close)
+if ta.crossunder(montana, signal)
+    alert("Konkorde: Señal de Venta Clásica", alert.freq_once_per_bar_close)
